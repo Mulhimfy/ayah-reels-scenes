@@ -1,0 +1,93 @@
+name: Publish new scenes
+
+# Encodes publish/new_scenes.json and uploads the stills to release v2
+# and the clips to v3 (a release holds at most 1000 files; v1 is near
+# that). The posters and the byte counts the app's catalog needs go to
+# the pre-release `new-scenes-meta`.
+on:
+  push:
+    branches: [publish-new]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for t in v2 v3; do
+            gh release view "$t" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+              gh release create "$t" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+                --title "Scene library $t" \
+                --notes "AyahReel sceneries: $([ $t = v2 ] && echo stills || echo clips) added in 2026-10. Sources and licences: publish/new_scenes.json."
+          done
+
+  encode:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg >/dev/null
+          pip install -q pillow
+      - run: python publish/encode.py ${{ matrix.part }} 8
+      - name: Upload to the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for t in v2 v3; do
+            ls out/$t | sed "s|^|out/$t/|" > files.txt || true
+            [ -s files.txt ] || continue
+            split -l 40 files.txt chunk.
+            for c in chunk.*; do
+              for i in 1 2 3; do
+                xargs -a "$c" gh release upload "$t" --repo "$GITHUB_REPOSITORY" --clobber && break
+                sleep 20
+              done
+              rm "$c"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meta-${{ matrix.part }}
+          path: out/meta
+
+  collect:
+    needs: encode
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meta-*
+          path: meta
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, json
+          out = {}
+          for p in glob.glob('meta/part-*.json'):
+              out.update(json.load(open(p)))
+          json.dump(out, open('new_scenes_built.json', 'w'), indent=0)
+          ok = sum('bytes' in v for v in out.values())
+          print(f'{ok} of {len(out)} built')
+          PY
+          tar -czf new_scene_posters.tar.gz -C meta posters
+          gh release delete new-scenes-meta --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create new-scenes-meta new_scenes_built.json new_scene_posters.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "New scenes: posters and sizes" --notes "For AyahReel's catalog."
